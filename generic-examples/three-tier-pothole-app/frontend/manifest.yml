@@ -1,0 +1,16 @@
+---
+applications:
+  - name: three-tier-frontend
+    memory: 256M
+
+    buildpacks:
+      - ruby_buildpack
+
+    services:
+      - three-tier-pothole-imgs
+
+    routes:
+      - route: report-a-pothole.london.cloudapps.digital
+
+    env:
+      API_URL: http://three-tier-backend.apps.internal:8080

@@ -5,6 +5,9 @@ source software on [GOV.UK PaaS](https://www.cloud.service.gov.uk).
 
 ## Index
 
+[generic-examples](generic-examples) contains demos that can be used in the
+future with minimal rework.
+
 [department-examples](department-examples) contains demos that we have done
 with departments and councils.
 
