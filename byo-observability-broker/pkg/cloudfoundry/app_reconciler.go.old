@@ -1,0 +1,204 @@
+
+import (
+	"context"
+	"io"
+
+	"code.cloudfoundry.org/cli/actor/sharedaction"
+	"code.cloudfoundry.org/cli/actor/v7action"
+	"code.cloudfoundry.org/cli/actor/v7pushaction"
+	"code.cloudfoundry.org/cli/api/cloudcontroller/ccerror"
+	"code.cloudfoundry.org/cli/api/cloudcontroller/ccv3"
+	"code.cloudfoundry.org/cli/api/cloudcontroller/ccv3/constant"
+	"code.cloudfoundry.org/cli/util/manifestparser"
+	"code.cloudfoundry.org/clock"
+)
+
+func (r *ApplicationReconciler) Reconcile(ctx context.Context, desired Application) error {
+	// get list of all prometheus apps owned by me (has label "owner:$me")
+	existingApp, warnings, err := r.Session.ClientV3.GetApplicationByNameAndSpace(desired.Name, r.SpaceGUID)
+	r.Log.Warn(warnings)
+	if err != nil {
+		if _, isNotFound := err.(ccerror.ApplicationNotFoundError); isNotFound {
+			r.Log.Info("creating")
+			// not found - create it
+			existingApp, warnings, err = r.Session.ClientV3.CreateApplication(ccv3.Application{
+				LifecycleBuildpacks: desired.Buildpacks,
+				LifecycleType:       constant.AppLifecycleTypeBuildpack,
+				State:               constant.ApplicationStopped,
+				Name:                desired.Name,
+				Relationships: ccv3.Relationships{
+					constant.RelationshipTypeSpace: ccv3.Relationship{GUID: r.SpaceGUID},
+				},
+			})
+			r.Log.Warn(warnings)
+			if err != nil {
+				return err
+			}
+			r.Log.Info("created", existingApp)
+		} else {
+			return err
+		}
+	} else {
+		r.Log.Warn("ONLY PARTIAL UPDATE IS IMPLEMENTED - MIGHT NOT WORK RIGHT")
+		existingApp, warnings, err = r.Session.ClientV3.UpdateApplication(ccv3.Application{
+			GUID:                existingApp.GUID,
+			Name:                desired.Name,
+			LifecycleBuildpacks: desired.Buildpacks,
+			LifecycleType:       constant.AppLifecycleTypeBuildpack,
+		})
+		r.Log.Warn(warnings)
+		if err != nil {
+			return err
+		}
+		r.Log.Info("updated", existingApp)
+	}
+	// find or create routes
+	existingRoutes, _, err := r.Session.ClientV3.GetApplicationRoutes(existingApp.GUID)
+	if err != nil {
+		return err
+	}
+	for _, desiredRoute := range desired.Routes {
+		desiredRoute.SpaceGUID = r.SpaceGUID
+		found := false
+		for _, route := range existingRoutes {
+			if route.DomainGUID != desiredRoute.DomainGUID {
+				continue
+			}
+			if route.Host != desiredRoute.Host {
+				continue
+			}
+			if route.Path != desiredRoute.Path {
+				continue
+			}
+			found = true
+		}
+		if !found {
+			r.Log.Info("creating", desiredRoute)
+			route, _, err := r.Session.ClientV3.CreateRoute(desiredRoute)
+			if err != nil {
+				return err
+			}
+			_, err = r.Session.ClientV3.MapRoute(route.GUID, existingApp.GUID)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	// push app
+	manifest := manifestparser.Manifest{
+		Applications: []manifestparser.Application{
+			{
+				Name:   desired.Name,
+				Memory: desired.Memory,
+				Path:   desired.Path,
+			},
+		},
+	}
+	sharedActor := sharedaction.NewActor(r.Session)
+	baseActor := v7action.NewActor(
+		r.Session.ClientV3,
+		r.Session.ConfigV3,
+		sharedActor,
+		r.Session.ClientUAA,
+		clock.NewClock(),
+	)
+	pushActor := v7pushaction.NewActor(baseActor, sharedActor)
+	pushPlans, warns, err := pushActor.CreatePushPlans(
+		r.SpaceGUID,
+		r.OrganizationGUID,
+		manifest,
+		v7pushaction.FlagOverrides{},
+	)
+	r.Log.Warn("warn", warns)
+	if err != nil {
+		return err
+	}
+
+	// func (actor Actor) CreateRoute(spaceGUID, domainName, hostname, path string) (Route, Warnings, error) {
+	// route, _, err := baseActor.CreateRoute(r.SpaceGUID, "apps.internal", desired.Name, "")
+	// if err != nil {
+	// 	return err
+	// }
+
+	r.Log.WithField("number of plans", len(pushPlans)).Println("completed generating plan")
+	progressbar := NewProgressBar() // TODO: guessing removing this
+
+	for _, plan := range pushPlans {
+		r.Log.WithField("app_name", plan.Application.Name).Info("actualizing")
+		eventStream := pushActor.Actualize(plan, progressbar)
+		err := r.eventStreamHandler(eventStream)
+		if err != nil {
+			return err
+		}
+	}
+	// get list of all prometheus services owned by me (has label "owner:$me")
+	// for any missing prometheus apps -> create
+	// for any apps that shouldn't exist -> delete
+	// get
+	return nil
+}
+
+func (r *ApplicationReconciler) eventStreamHandler(eventStream <-chan *v7pushaction.PushEvent) error {
+	for event := range eventStream {
+		r.Log.Warn("warn", event.Warnings)
+		if event.Err != nil {
+			return event.Err
+		}
+		err := r.processEvent(event.Event, event.Plan.Application.Name)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *ApplicationReconciler) processEvent(event v7pushaction.Event, appName string) error {
+	switch event {
+	// case v7pushaction.StartingStaging:
+	// 	r.Log.Debug("Staging app and tracing logs...")
+	// 	logStream, errStream, cancelFunc, warnings, err := cmd.VersionActor.GetStreamingLogsForApplicationByNameAndSpace(
+	// 		appName,
+	// 		cmd.Config.TargetedSpace().GUID,
+	// 		cmd.LogCacheClient
+	// 	)
+	// 	r.Log.Warn(warnings)
+	// 	if err != nil {
+	// 		return err
+	// 	}
+	// 	if cmd.stopStreamingFunc != nil {
+	// 		cmd.stopStreamingFunc()
+	// 	}
+	// 	cmd.stopStreamingFunc = cancelFunc
+	// 	go cmd.getLogs(logStream, errStream)
+	// case v7pushaction.StagingComplete:
+	// 	if cmd.stopStreamingFunc != nil {
+	// 		cmd.stopStreamingFunc()
+	// 		cmd.stopStreamingFunc = nil
+	// 	}
+	default:
+		r.Log.WithField("event", event).Info(appName)
+	}
+
+	return nil
+}
+
+// dummy progress bar
+type ProgressBar struct {
+}
+
+func NewProgressBar() *ProgressBar {
+	return &ProgressBar{}
+}
+
+func (p *ProgressBar) Complete() {
+	// noop
+}
+
+func (p *ProgressBar) NewProgressBarWrapper(reader io.Reader, sizeOfFile int64) io.Reader {
+	return reader
+}
+
+func (p *ProgressBar) Ready() {
+	// noop
+}
