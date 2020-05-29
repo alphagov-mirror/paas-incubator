@@ -1,0 +1,10 @@
+# this is the base config for prometheus that will get extended and filled in
+# by the prometheus-config-reloader
+---
+global:
+  scrape_interval: 30s
+  evaluation_interval: 30s
+  external_labels: {}
+rule_files:
+- rules/*.yaml
+scrape_configs: []

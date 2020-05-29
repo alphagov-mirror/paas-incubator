@@ -1,0 +1,9 @@
+# ----------------------
+# DO NOT EDIT
+# -----------------------
+# this is the initial config on first startup
+# the config-reloader will overwrite this once it's up
+---
+global:
+  external_labels: {}
+scrape_configs: []
