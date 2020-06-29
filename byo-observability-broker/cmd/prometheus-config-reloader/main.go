@@ -14,6 +14,7 @@ import (
 	cfenv "github.com/cloudfoundry-community/go-cfenv"
 	config_util "github.com/prometheus/common/config"
 	promconfig "github.com/prometheus/prometheus/config"
+	"github.com/sirupsen/logrus"
 	"gopkg.in/yaml.v2"
 )
 
@@ -66,6 +67,7 @@ func Main(ctx context.Context) error {
 		Labels: map[string]string{
 			"space": appEnv.SpaceName,
 		},
+		Log: logrus.New(),
 	}
 	// check for any scrape configs passed from environment
 	additionalScrapeConfigsYAML := os.Getenv("PROMETHEUS_SCRAPE_CONFIGS")
@@ -78,6 +80,7 @@ func Main(ctx context.Context) error {
 		reloader.ScrapeConfigs = additionalScrapeConfigs
 	}
 	// detect if we have influx backing and add relevent config
+	// TODO: move this into reloader
 	influxServices, ok := appEnv.Services["influxdb"]
 	if ok {
 		for _, influxService := range influxServices {

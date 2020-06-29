@@ -35,6 +35,7 @@ require (
 	github.com/google/go-querystring v1.0.0 // indirect
 	github.com/gophercloud/gophercloud v0.11.0 // indirect
 	github.com/gorilla/websocket v1.4.2 // indirect
+	github.com/grafana-tools/sdk v0.0.0-20200520194427-14a3f1e087f0
 	github.com/grpc-ecosystem/grpc-gateway v1.14.6 // indirect
 	github.com/lunixbochs/vtclean v1.0.0 // indirect
 	github.com/mailru/easyjson v0.7.2-0.20200524104011-8ba3c7bdceed // indirect
@@ -48,6 +49,7 @@ require (
 	github.com/prometheus/prometheus v1.8.2-0.20200507164740-ecee9c8abfd1
 	github.com/sabhiram/go-gitignore v0.0.0-20180611051255-d3107576ba94 // indirect
 	github.com/sirupsen/logrus v1.6.0
+	github.com/sspencer/go-ini v0.0.0-20141212062048-adb75e3175bb // indirect
 	github.com/tedsuo/rata v1.0.0 // indirect
 	github.com/vito/go-interact v1.0.0 // indirect
 	google.golang.org/api v0.25.0 // indirect

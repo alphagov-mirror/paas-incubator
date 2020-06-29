@@ -1,7 +1,6 @@
 package cloudfoundry
 
 import (
-	"fmt"
 	"io/ioutil"
 	"os"
 	"os/exec"
@@ -61,25 +60,23 @@ func (cli *CLIClient) Push(manifest Manifest) error {
 		return err
 	}
 	// push
-	fmt.Println("pushing", string(manifestYAML))
 	return cli.cf(workdir,
 		"push",
 		"-f", manifestPath,
 	)
 }
 
-func (cli *CLIClient) CreateService(service Service) error {
-	// login
+// cf add-network-policy PUBLIC_APPNAME --destination-app PRIVATE_APPNAME --protocol tcp --port 8080
+func (cli *CLIClient) AddNetworkPolicy(srcAppName, dstAppName, port string) error {
 	if err := cli.Authenticate(); err != nil {
 		return err
 	}
-	// create service
-	// cf create-service db-service silver mydb -t "list, of, tags"
 	return cli.cf(DefaultWorkDir,
-		"create-service",
-		service.ServiceName,
-		service.PlanName,
-		service.InstanceName,
+		"add-network-policy",
+		srcAppName,
+		"--destination-app", dstAppName,
+		"--protocol", "tcp",
+		"--port", port, // FIXME: this is dynamic init? get from route?
 	)
 }
 

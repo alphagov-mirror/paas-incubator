@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
+	"sync"
 	"syscall"
 	"time"
 
 	"code.cloudfoundry.org/cli/api/cloudcontroller/ccv2"
+	"code.cloudfoundry.org/cli/api/cloudcontroller/ccv3"
 	"github.com/alphagov/paas-incubator/byo-observability-broker/pkg/cloudfoundry"
 	"github.com/mitchellh/go-ps"
 	prommodel "github.com/prometheus/common/model"
@@ -17,6 +19,7 @@ import (
 	promsd "github.com/prometheus/prometheus/discovery/config"
 	promdns "github.com/prometheus/prometheus/discovery/dns"
 	"github.com/prometheus/prometheus/pkg/labels"
+	"github.com/sirupsen/logrus"
 	yaml "gopkg.in/yaml.v2"
 )
 
@@ -30,6 +33,9 @@ type Reloader struct {
 	RemoteWriteConfigs     []*promconfig.RemoteWriteConfig
 	RemoteReadConfigs      []*promconfig.RemoteReadConfig
 	ScrapeConfigs          []*promconfig.ScrapeConfig
+	Log                    *logrus.Logger
+	oldYAML                []byte
+	sync.Mutex
 }
 
 func (r *Reloader) GenerateConfig() (*promconfig.Config, error) {
@@ -85,7 +91,7 @@ func (r *Reloader) generateScrapeConfigsForBindings() ([]*promconfig.ScrapeConfi
 			Values:   []string{app.GUID},
 		})
 		if len(routeMappings) < 1 {
-			log.Printf("skipping %s as it has no route mappings", app.Name)
+			r.Log.Infof("skipping %s as it has no route mappings", app.Name)
 			continue
 		}
 		// for each route, add dns service discovery config for suitable routes
@@ -95,10 +101,6 @@ func (r *Reloader) generateScrapeConfigsForBindings() ([]*promconfig.ScrapeConfi
 			if err != nil {
 				return nil, err
 			}
-			port := 8080
-			if route.Port.IsSet {
-				port = route.Port.Value
-			}
 			domain, _, err := r.Session.ClientV2.GetSharedDomain(route.DomainGUID)
 			if err != nil {
 				return nil, err
@@ -107,19 +109,35 @@ func (r *Reloader) generateScrapeConfigsForBindings() ([]*promconfig.ScrapeConfi
 			// Skip any non-internal routes to avoid auth issues
 			// TODO: allow non-internal if given explicitly in binding params
 			if !domain.Internal {
-				log.Printf("skipping %s for %s as it is not an internal route", scrapeAddr, app.Name) // TODO: this is a a debug msg, normal behaviour
+				r.Log.Warnf("skipping %s for %s as it is not an internal route", scrapeAddr, app.Name) // TODO: this is a a debug msg, normal behaviour
 				continue
 			}
-			dnsConfigs = append(dnsConfigs, &promdns.SDConfig{
-				Names:           []string{scrapeAddr}, // TODO: get from binding params, fallback to this
-				RefreshInterval: prommodel.Duration(30 * time.Second),
-				Type:            "A",
-				Port:            port, // TODO: get from binding params, fallback to this
-			})
-			log.Printf("adding %s as dns target for %s", scrapeAddr, app.Name) // TODO: this is a a debug msg, normal behaviour
+			// since the ccv3/ccv2 libraries don't return port in route/destinations
+			// we have to do this, otherwise there is no way to know what port the web process
+			// is listening on
+			// FIXME: remove this and use the value in "route.Destinations" once upstream
+			// implement it.
+			destinations, _, err := r.hackGetRouteDestinations(mapping.RouteGUID)
+			if err != nil {
+				return nil, err
+			}
+			for _, dest := range destinations {
+				r.Log.Infof("considering %s:%d for %s...", scrapeAddr, dest.Port, app.Name) // TODO: this is a a debug msg, normal behaviour
+				if dest.App.Process.Type != "web" {                                         // FIXME: is this always true? how else can we work out which port we mean
+					r.Log.Infof("skipping %s:%d for %s as it is not a 'web' process route", scrapeAddr, dest.Port, app.Name) // TODO: this is a a debug msg, normal behaviour
+					continue
+				}
+				dnsConfigs = append(dnsConfigs, &promdns.SDConfig{
+					Names:           []string{scrapeAddr}, // TODO: get from binding params, fallback to this
+					RefreshInterval: prommodel.Duration(30 * time.Second),
+					Type:            "A",
+					Port:            dest.Port, // TODO: get from binding params, fallback to this
+				})
+				r.Log.Infof("adding %s:%d as dns target for %s", scrapeAddr, dest.Port, app.Name) // TODO: this is a a debug msg, normal behaviour
+			}
 		}
 		if len(dnsConfigs) < 1 {
-			log.Printf("skipping %s as doesn't have any internal routes mapped", app.Name)
+			r.Log.Warnf("skipping %s as doesn't have any internal routes mapped", app.Name)
 			continue
 		}
 		scrapeConfigs = append(scrapeConfigs, &promconfig.ScrapeConfig{
@@ -135,51 +153,58 @@ func (r *Reloader) generateScrapeConfigsForBindings() ([]*promconfig.ScrapeConfi
 }
 
 func (r *Reloader) Run(ctx context.Context) error {
-	var oldYAML []byte
 	var interval time.Duration
 	for {
-		if bytes.Equal(oldYAML, []byte{}) { // while no config
+		if bytes.Equal(r.oldYAML, []byte{}) { // while no config
 			interval = 2 * time.Second
 		} else {
 			interval = r.PollingInterval
 		}
 		reload := time.After(interval)
-		log.Printf("next reload at %v", time.Now().Add(r.PollingInterval))
+		r.Log.Infof("next reload at %v", time.Now().Add(r.PollingInterval))
 		select {
 		case <-reload:
-			// create config
-			cfg, err := r.GenerateConfig()
-			if err != nil {
-				return err // TODO: maybe not go bang here
+			if err := r.updateConfig(ctx); err != nil {
+				r.Log.Error(err)
+				time.Sleep(30 * time.Second)
 			}
-			cfgYAML, err := yaml.Marshal(cfg)
-			if err != nil {
-				return err
-			}
-			if bytes.Equal(cfgYAML, []byte{}) {
-				return fmt.Errorf("something went wrong, empty config generated")
-			}
-			if bytes.Equal(cfgYAML, oldYAML) {
-				log.Println("config unchanged")
-				continue
-			}
-			// write the config to disk
-			log.Println("writing config:", r.TargetConfigPath)
-			log.Println(string(cfgYAML))
-			if err := ioutil.WriteFile(r.TargetConfigPath, cfgYAML, 0644); err != nil {
-				return err
-			}
-			// poke prometheus process to reload config
-			if err := signalProcess("prometheus", syscall.SIGHUP); err != nil {
-				log.Println(err)
-				continue
-			}
-			// record config to avoid reloads when no changes
-			oldYAML = cfgYAML
 		case <-ctx.Done():
 			return nil
 		}
 	}
+}
+
+func (r *Reloader) updateConfig(ctx context.Context) error {
+	r.Lock()
+	defer r.Unlock()
+	// create config
+	cfg, err := r.GenerateConfig()
+	if err != nil {
+		return err
+	}
+	cfgYAML, err := yaml.Marshal(cfg)
+	if err != nil {
+		return err
+	}
+	if bytes.Equal(cfgYAML, []byte{}) {
+		return fmt.Errorf("something went wrong, empty config generated")
+	}
+	if bytes.Equal(cfgYAML, r.oldYAML) {
+		r.Log.Debug("config unchanged")
+		return nil
+	}
+	// write the config to disk
+	r.Log.Info("writing config:", r.TargetConfigPath)
+	r.Log.Info(string(cfgYAML))
+	if err := ioutil.WriteFile(r.TargetConfigPath, cfgYAML, 0644); err != nil {
+		return err
+	}
+	// poke prometheus process to reload config
+	if err := signalProcess("prometheus", syscall.SIGHUP); err != nil {
+		return err
+	}
+	r.oldYAML = cfgYAML
+	return nil
 }
 
 func signalProcess(name string, sig syscall.Signal) error {
@@ -197,4 +222,25 @@ func signalProcess(name string, sig syscall.Signal) error {
 		}
 	}
 	return nil
+}
+
+// I need the port in the destination, but ccv2 and ccv3 clients haven't implemnented it
+// so make a func that fetches the full response
+type RouteDestination struct {
+	Port int
+	ccv3.RouteDestination
+}
+
+func (r *Reloader) hackGetRouteDestinations(routeGUID string) ([]RouteDestination, []string, error) {
+	var responseBody struct {
+		Destinations []RouteDestination `json:"destinations"`
+	}
+
+	_, _, err := r.Session.ClientV3.MakeRequest(ccv3.RequestParams{
+		RequestName:  "GetRouteDestinations",
+		URIParams:    map[string]string{"route_guid": routeGUID},
+		ResponseBody: &responseBody,
+	})
+
+	return responseBody.Destinations, nil, err
 }
